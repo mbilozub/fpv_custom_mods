@@ -1,0 +1,263 @@
+Index: src/main/cli/settings.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/main/cli/settings.c	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/main/cli/settings.c	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -1211,6 +1211,7 @@
+ #ifdef USE_RX_LINK_QUALITY_INFO
+     { "osd_warn_link_quality",      VAR_UINT32  | MASTER_VALUE | MODE_BITSET, .config.bitpos = OSD_WARNING_LINK_QUALITY,     PG_OSD_CONFIG, offsetof(osdConfig_t, enabledWarnings)},
+ #endif
++    { "osd_warn_dji",               VAR_UINT32  | MASTER_VALUE | MODE_BITSET, .config.bitpos = OSD_WARNING_DJI,              PG_OSD_CONFIG, offsetof(osdConfig_t, enabledWarnings)},
+ 
+     { "osd_rssi_alarm",             VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0, 100 }, PG_OSD_CONFIG, offsetof(osdConfig_t, rssi_alarm) },
+ #ifdef USE_RX_LINK_QUALITY_INFO
+Index: src/main/msp/msp.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/main/msp/msp.c	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/main/msp/msp.c	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -975,6 +975,14 @@
+ 
+     case MSP_NAME:
+         {
++#ifdef USE_OSD
++            // Show warning for DJI OSD instead of pilot name
++            // works if osd_warning_enabled is on, osd_warn_dji is on and usb is not connected
++            if (osdWarnDjiEnabled()) {
++                sbufWriteString(dst, djiWarningBuffer);
++                break;
++            }
++#endif
+             const int nameLen = strlen(pilotConfig()->name);
+             for (int i = 0; i < nameLen; i++) {
+                 sbufWriteU8(dst, pilotConfig()->name[i]);
+Index: src/main/osd/osd.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/main/osd/osd.c	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/main/osd/osd.c	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -56,6 +56,9 @@
+ #include "drivers/flash.h"
+ #include "drivers/max7456_symbols.h"
+ #include "drivers/sdcard.h"
++#ifdef USE_VCP
++#include "drivers/serial_usb_vcp.h"
++#endif
+ #include "drivers/time.h"
+ 
+ #include "fc/rc_controls.h"
+@@ -303,6 +306,9 @@
+     }
+     osdConfig->rssi_dbm_alarm = 60;
+     osdConfig->gps_sats_show_hdop = false;
++
++    // Turn off replacing craft name for DJI OSD
++    osdWarnSetState(OSD_WARNING_DJI, false);
+ }
+ 
+ static void osdDrawLogo(int x, int y)
+@@ -926,6 +932,15 @@
+     suppressStatsDisplay = flag;
+ }
+ 
++bool osdWarnDjiEnabled(void)
++{
++    return osdWarnGetState(OSD_WARNING_DJI)
++#ifdef USE_VCP
++                && !usbVcpIsConnected()
++#endif
++    ;
++}
++
+ #ifdef USE_OSD_PROFILES
+ bool osdElementVisible(uint16_t value)
+ {
+Index: src/main/osd/osd.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/main/osd/osd.h	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/main/osd/osd.h	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -216,6 +216,7 @@
+     OSD_WARNING_RSSI,
+     OSD_WARNING_LINK_QUALITY,
+     OSD_WARNING_RSSI_DBM,
++    OSD_WARNING_DJI,
+     OSD_WARNING_COUNT // MUST BE LAST
+ } osdWarningsFlags_e;
+ 
+@@ -297,6 +298,7 @@
+ void osdWarnSetState(uint8_t warningIndex, bool enabled);
+ bool osdWarnGetState(uint8_t warningIndex);
+ void osdSuppressStats(bool flag);
++bool osdWarnDjiEnabled(void);
+ 
+ uint8_t getCurrentOsdProfileIndex(void);
+ void changeOsdProfileIndex(uint8_t profileIndex);
+Index: src/main/osd/osd_elements.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/main/osd/osd_elements.c	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/main/osd/osd_elements.c	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -159,6 +159,8 @@
+ #define IS_BLINK(item) (blinkBits[(item) / 32] & (1 << ((item) % 32)))
+ #define BLINK(item) (IS_BLINK(item) && blinkState)
+ 
++char djiWarningBuffer[12];
++
+ #if defined(USE_ESC_SENSOR) || defined(USE_DSHOT_TELEMETRY)
+ typedef int (*getEscRpmOrFreqFnPtr)(int i);
+ 
+@@ -1637,6 +1639,16 @@
+     osdElementDrawFunction[item](&element);
+     if (element.drawElement) {
+         displayWrite(osdDisplayPort, elemPosX, elemPosY, buff);
++
++        // Save warning for DJI
++        if (item == OSD_WARNINGS && osdWarnDjiEnabled()) {
++            if (strlen(buff)) {
++                tfp_sprintf(djiWarningBuffer, buff);
++            } else {
++                // Set an empty string, because if the warning is NULL, DJI will display CRAFT_NAME
++                tfp_sprintf(djiWarningBuffer, "           ");
++            }
++        }
+     }
+ 
+     return true;
+Index: src/main/osd/osd_elements.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/main/osd/osd_elements.h	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/main/osd/osd_elements.h	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -35,6 +35,8 @@
+ 
+ typedef void (*osdElementDrawFn)(osdElementParms_t *element);
+ 
++extern char djiWarningBuffer[12];
++
+ int osdConvertTemperatureToSelectedUnit(int tempInDegreesCelcius);
+ void osdFormatDistanceString(char *result, int distance, char leadingSymbol);
+ bool osdFormatRtcDateTime(char *buffer);
+Index: src/test/unit/link_quality_unittest.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/test/unit/link_quality_unittest.cc	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/test/unit/link_quality_unittest.cc	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -90,6 +90,8 @@
+     void osdRefresh(timeUs_t currentTimeUs);
+     uint16_t updateLinkQualitySamples(uint16_t value);
+     uint16_t scaleCrsfLq(uint16_t lqvalue);
++    bool usbCableIsInserted(void) { return false; }
++    bool usbVcpIsConnected(void) { return false; }
+ #define LINK_QUALITY_SAMPLE_COUNT 16
+ }
+ 
+Index: src/test/unit/osd_unittest.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- src/test/unit/osd_unittest.cc	(revision 89051e2561a3daf0f52e2965826a9298b2ba1d20)
++++ src/test/unit/osd_unittest.cc	(revision 8d1a854d23ff3d661bea8cf28435136d0691d57a)
+@@ -65,6 +65,8 @@
+     void osdRefresh(timeUs_t currentTimeUs);
+     void osdFormatTime(char * buff, osd_timer_precision_e precision, timeUs_t time);
+     int osdConvertTemperatureToSelectedUnit(int tempInDegreesCelcius);
++    bool usbCableIsInserted(void) { return false; }
++    bool usbVcpIsConnected(void) { return false; }
+ 
+     uint16_t rssi;
+     attitudeEulerAngles_t attitude;
+@@ -1062,6 +1064,78 @@
+     EXPECT_EQ(osdConvertTemperatureToSelectedUnit(41), 106);
+ }
+ 
++/*
++ * Tests the warnings are not showing for DJI OSD.
++ */
++TEST(OsdTest, TestElementWarningDJIDisabled)
++{
++    // given
++    osdConfigMutable()->enabledWarnings = 0;  // disable all warnings
++    osdWarnSetState(OSD_WARNING_BATTERY_WARNING, true);
++
++	// when
++    displayClearScreen(&testDisplayPort);
++    osdRefresh(simulationTime);
++
++    // then
++    for (int i = 0; i < 12; i++) {
++        EXPECT_EQ(NULL, djiWarningBuffer[i]);
++    }
++
++    // low battery
++    simulationBatteryVoltage = 1400;
++    simulationBatteryState = BATTERY_WARNING;
++
++    // when
++    displayClearScreen(&testDisplayPort);
++    osdRefresh(simulationTime);
++
++    // then
++    for (int i = 0; i < 12; i++) {
++        EXPECT_EQ(NULL, djiWarningBuffer[i]);
++    }
++}
++
++/*
++ * Tests the warnings are shown for DJI OSD.
++ */
++TEST(OsdTest, TestElementWarningDJIEnabled)
++{
++    // given
++    osdConfigMutable()->enabledWarnings = 0;  // disable all warnings
++    osdWarnSetState(OSD_WARNING_BATTERY_WARNING, true);
++    osdWarnSetState(OSD_WARNING_DJI, true);
++
++    // low battery
++    simulationBatteryVoltage = 1400;
++    simulationBatteryState = BATTERY_WARNING;
++
++    // when
++    displayClearScreen(&testDisplayPort);
++    osdRefresh(simulationTime);
++
++    // then
++    char stringLow[12] = "LOW BATTERY";
++    for (int i = 0; i < 12; i++) {
++        EXPECT_EQ(stringLow[i], djiWarningBuffer[i]);
++    }
++
++    // and
++    // used battery
++    simulationBatteryVoltage = ((batteryConfig()->vbatmaxcellvoltage - 20) * simulationBatteryCellCount) - 1;
++    simulationBatteryState = BATTERY_OK;
++
++    // when
++    displayClearScreen(&testDisplayPort);
++    osdRefresh(simulationTime);
++
++    // then
++    char stringEmpty[12] = "           ";
++    for (int i = 0; i < 12; i++) {
++        EXPECT_EQ(stringEmpty[i], djiWarningBuffer[i]);
++	}
++}
++
+ // STUBS
+ extern "C" {
+     bool featureIsEnabled(uint32_t f) { return simulationFeatureFlags & f; }

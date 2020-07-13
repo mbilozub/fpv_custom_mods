@@ -1,0 +1,5 @@
+# Editors
+.idea/*
+
+# Misc
+.DS_Store
