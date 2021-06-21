@@ -1,0 +1,114 @@
+diff --git a/src/main/osd/osd.h b/src/main/osd/osd.h
+--- a/src/main/osd/osd.h	(revision 9ae2fe6d6935fc066debcf47dd18628db7b56fe7)
++++ b/src/main/osd/osd.h	(date 1624255010776)
+@@ -245,6 +245,7 @@
+     OSD_WARNING_LINK_QUALITY,
+     OSD_WARNING_RSSI_DBM,
+     OSD_WARNING_OVER_CAP,
++    OSD_WARNING_DJI,
+     OSD_WARNING_COUNT // MUST BE LAST
+ } osdWarningsFlags_e;
+ 
+@@ -344,6 +345,7 @@
+ void osdStatSetState(uint8_t statIndex, bool enabled);
+ bool osdStatGetState(uint8_t statIndex);
+ void osdSuppressStats(bool flag);
++bool osdWarnDjiEnabled(void);
+ void osdAnalyzeActiveElements(void);
+ void changeOsdProfileIndex(uint8_t profileIndex);
+ uint8_t getCurrentOsdProfileIndex(void);
+diff --git a/src/main/osd/osd_elements.c b/src/main/osd/osd_elements.c
+--- a/src/main/osd/osd_elements.c	(revision 9ae2fe6d6935fc066debcf47dd18628db7b56fe7)
++++ b/src/main/osd/osd_elements.c	(date 1624255087282)
+@@ -226,6 +226,8 @@
+ #define IS_BLINK(item) (blinkBits[(item) / 32] & (1 << ((item) % 32)))
+ #define BLINK(item) (IS_BLINK(item) && blinkState)
+ 
++char djiWarningBuffer[12];
++
+ enum {UP, DOWN};
+ 
+ static int osdDisplayWrite(osdElementParms_t *element, uint8_t x, uint8_t y, uint8_t attr, const char *s)
+@@ -1773,6 +1775,16 @@
+     osdElementDrawFunction[item](&element);
+     if (element.drawElement) {
+         osdDisplayWrite(&element, elemPosX, elemPosY, element.attr, buff);
++
++        // Save warning for DJI
++        if (item == OSD_WARNINGS && osdWarnDjiEnabled()) {
++            if (strlen(buff)) {
++                tfp_sprintf(djiWarningBuffer, buff);
++            } else {
++                // Set an empty string, because if the warning is NULL, DJI will display CRAFT_NAME
++                tfp_sprintf(djiWarningBuffer, "           ");
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/main/osd/osd_elements.h b/src/main/osd/osd_elements.h
+--- a/src/main/osd/osd_elements.h	(revision 9ae2fe6d6935fc066debcf47dd18628db7b56fe7)
++++ b/src/main/osd/osd_elements.h	(date 1624255104811)
+@@ -44,6 +44,8 @@
+ 
+ typedef void (*osdElementDrawFn)(osdElementParms_t *element);
+ 
++extern char djiWarningBuffer[12];
++
+ int osdConvertTemperatureToSelectedUnit(int tempInDegreesCelcius);
+ void osdFormatDistanceString(char *result, int distance, char leadingSymbol);
+ bool osdFormatRtcDateTime(char *buffer);
+diff --git a/src/main/cli/settings.c b/src/main/cli/settings.c
+--- a/src/main/cli/settings.c	(revision 9ae2fe6d6935fc066debcf47dd18628db7b56fe7)
++++ b/src/main/cli/settings.c	(date 1624254872490)
+@@ -1300,6 +1300,7 @@
+     { "osd_warn_rssi_dbm",          VAR_UINT32  | MASTER_VALUE | MODE_BITSET, .config.bitpos = OSD_WARNING_RSSI_DBM,         PG_OSD_CONFIG, offsetof(osdConfig_t, enabledWarnings)},
+ #endif
+     { "osd_warn_over_cap",          VAR_UINT32  | MASTER_VALUE | MODE_BITSET, .config.bitpos = OSD_WARNING_OVER_CAP,         PG_OSD_CONFIG, offsetof(osdConfig_t, enabledWarnings)},
++    { "osd_warn_dji",               VAR_UINT32  | MASTER_VALUE | MODE_BITSET, .config.bitpos = OSD_WARNING_DJI,              PG_OSD_CONFIG, offsetof(osdConfig_t, enabledWarnings)},
+ 
+     { "osd_rssi_alarm",             VAR_UINT8  | MASTER_VALUE, .config.minmaxUnsigned = { 0, 100 }, PG_OSD_CONFIG, offsetof(osdConfig_t, rssi_alarm) },
+ #ifdef USE_RX_LINK_QUALITY_INFO
+diff --git a/src/main/msp/msp.c b/src/main/msp/msp.c
+--- a/src/main/msp/msp.c	(revision 9ae2fe6d6935fc066debcf47dd18628db7b56fe7)
++++ b/src/main/msp/msp.c	(date 1624254930803)
+@@ -1093,6 +1093,14 @@
+ 
+     case MSP_NAME:
+         {
++#ifdef USE_OSD
++            // Show warning for DJI OSD instead of pilot name
++            // works if osd_warning_enabled is on, osd_warn_dji is on and usb is not connected
++            if (osdWarnDjiEnabled()) {
++                sbufWriteString(dst, djiWarningBuffer);
++                break;
++            }
++#endif
+             const int nameLen = strlen(pilotConfig()->name);
+             for (int i = 0; i < nameLen; i++) {
+                 sbufWriteU8(dst, pilotConfig()->name[i]);
+diff --git a/src/main/osd/osd.c b/src/main/osd/osd.c
+--- a/src/main/osd/osd.c	(revision 9ae2fe6d6935fc066debcf47dd18628db7b56fe7)
++++ b/src/main/osd/osd.c	(date 1624254983587)
+@@ -382,6 +382,9 @@
+     osdConfig->stat_show_cell_value = false;
+     osdConfig->task_frequency = OSD_TASK_FREQUENCY_DEFAULT;
+     osdConfig->cms_background_type = DISPLAY_BACKGROUND_TRANSPARENT;
++
++    // Turn off replacing craft name for DJI OSD
++    osdWarnSetState(OSD_WARNING_DJI, false);
+ }
+ 
+ void pgResetFn_osdElementConfig(osdElementConfig_t *osdElementConfig)
+@@ -1098,6 +1101,11 @@
+     suppressStatsDisplay = flag;
+ }
+ 
++bool osdWarnDjiEnabled(void)
++{
++    return osdWarnGetState(OSD_WARNING_DJI);
++}
++
+ #ifdef USE_OSD_PROFILES
+ bool osdElementVisible(uint16_t value)
+ {
